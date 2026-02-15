@@ -52,6 +52,9 @@ start_from = 1
 
 [batch]
 csv_path = accounts.csv
+
+[report]
+path = migration.log
 ```
 
 Tip: keep `config.ini` out of git. Store credentials locally.
@@ -76,6 +79,19 @@ List folders (useful for localized names):
 ```bash
 ./migrate_imap.py --config config.ini --list-mailboxes
 ./migrate_imap.py --config config.ini --list-mailboxes-raw
+```
+
+## Report Log
+Write a report file with all console logs:
+
+```bash
+./migrate_imap.py --config config.ini --report-file migration.log
+```
+
+Or set it in `config.ini`:
+```ini
+[report]
+path = migration.log
 ```
 
 ## Batch Mode (CSV)

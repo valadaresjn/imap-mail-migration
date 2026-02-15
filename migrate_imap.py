@@ -23,6 +23,40 @@ def _env(key: str, default: Optional[str] = None) -> Optional[str]:
     return os.environ.get(key, default)
 
 
+REPORT_FILE_HANDLE = None
+
+
+def open_report_file(path: str) -> None:
+    global REPORT_FILE_HANDLE
+    if not path:
+        return
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    REPORT_FILE_HANDLE = open(path, "a", encoding="utf-8")
+    ts = datetime.now().isoformat(timespec="seconds")
+    REPORT_FILE_HANDLE.write(f"=== Migration run started {ts} ===\n")
+    REPORT_FILE_HANDLE.flush()
+
+
+def close_report_file() -> None:
+    global REPORT_FILE_HANDLE
+    if REPORT_FILE_HANDLE:
+        ts = datetime.now().isoformat(timespec="seconds")
+        REPORT_FILE_HANDLE.write(f"=== Migration run ended {ts} ===\n")
+        REPORT_FILE_HANDLE.flush()
+        REPORT_FILE_HANDLE.close()
+        REPORT_FILE_HANDLE = None
+
+
+def log_message(message: str) -> None:
+    print(message)
+    if REPORT_FILE_HANDLE:
+        ts = datetime.now().isoformat(timespec="seconds")
+        REPORT_FILE_HANDLE.write(f"{ts} {message}\n")
+        REPORT_FILE_HANDLE.flush()
+
+
 def retry_call(func, label: str, retries: int = 4, base_delay: float = 0.75):
     last_exc: Optional[Exception] = None
     for attempt in range(1, retries + 1):
@@ -33,7 +67,7 @@ def retry_call(func, label: str, retries: int = 4, base_delay: float = 0.75):
             if attempt >= retries:
                 break
             delay = base_delay * (2 ** (attempt - 1))
-            print(f"  [WARN] {label} failed (attempt {attempt}/{retries}): {exc} -> retry in {delay:.2f}s")
+            log_message(f"  [WARN] {label} failed (attempt {attempt}/{retries}): {exc} -> retry in {delay:.2f}s")
             time.sleep(delay)
     raise RuntimeError(f"{label} failed after {retries} attempts: {last_exc}")
 
@@ -565,7 +599,7 @@ def keepalive(conn: imaplib.IMAP4, label: str) -> None:
     try:
         retry_call(lambda: conn.noop(), label=f"{label} NOOP")
     except Exception as exc:
-        print(f"  [WARN] {label} keepalive failed: {exc}")
+        log_message(f"  [WARN] {label} keepalive failed: {exc}")
 
 
 def append_message(
@@ -639,7 +673,7 @@ def select_with_reconnect(
         return conn, total
     except Exception as exc:
         if is_logout_error(exc):
-            print(f"  [WARN] {label} connection was logged out. Reconnecting...")
+            log_message(f"  [WARN] {label} connection was logged out. Reconnecting...")
             try:
                 conn.logout()
             except Exception:
@@ -663,7 +697,7 @@ def ensure_mailbox_with_reconnect(
         return conn
     except Exception as exc:
         if is_logout_error(exc):
-            print(f"  [WARN] {label} connection was logged out. Reconnecting...")
+            log_message(f"  [WARN] {label} connection was logged out. Reconnecting...")
             try:
                 conn.logout()
             except Exception:
@@ -681,16 +715,16 @@ def migrate_mailbox(
     mailbox: str,
     cfg: MigrationConfig,
 ) -> Tuple[int, int, imaplib.IMAP4, imaplib.IMAP4]:
-    print(f"\n==> Migrating mailbox: {mailbox}")
-    print(f"Source account: {cfg.src.username} -> Destination account: {cfg.dst.username}")
+    log_message(f"\n==> Migrating mailbox: {mailbox}")
+    log_message(f"Source account: {cfg.src.username} -> Destination account: {cfg.dst.username}")
 
     src, total_src = select_with_reconnect(src, cfg.src, "source", mailbox, cfg.socket_timeout)
-    print(f"Source messages (reported): {total_src}")
+    log_message(f"Source messages (reported): {total_src}")
 
     dst = ensure_mailbox_with_reconnect(dst, cfg.dst, "destination", mailbox, cfg.socket_timeout)
     append_limit = get_append_limit(dst)
     if append_limit:
-        print(f"Destination APPEND limit: {append_limit} bytes")
+        log_message(f"Destination APPEND limit: {append_limit} bytes")
 
     uids = search_messages(src, cfg.since)
     if cfg.max_messages:
@@ -698,13 +732,13 @@ def migrate_mailbox(
 
     if cfg.start_from > 1:
         if cfg.start_from > len(uids):
-            print(f"Start_from {cfg.start_from} is beyond total messages {len(uids)}. Nothing to do.")
+            log_message(f"Start_from {cfg.start_from} is beyond total messages {len(uids)}. Nothing to do.")
             return 0, 0
-        print(f"Resuming from message #{cfg.start_from} (1-based index).")
+        log_message(f"Resuming from message #{cfg.start_from} (1-based index).")
         uids = uids[cfg.start_from - 1 :]
 
     if not uids:
-        print("No messages to migrate.")
+        log_message("No messages to migrate.")
         return 0, 0, src, dst
 
     migrated = 0
@@ -720,14 +754,14 @@ def migrate_mailbox(
                     size, flags, internaldate = fetch_message_meta(src, uid)
                     if append_limit and size > append_limit:
                         failed += 1
-                        print(
+                        log_message(
                             f"  [ERROR] UID {uid_str(uid)} - message size {size} exceeds destination APPEND limit {append_limit}"
                         )
                         continue
                     raw_msg = fetch_message_body(src, uid)
                 except Exception as exc:
                     if cfg.reconnect_on_failure and is_transport_error(exc):
-                        print("  [WARN] fetch failed due to socket error. Reconnecting source...")
+                        log_message("  [WARN] fetch failed due to socket error. Reconnecting source...")
                         try:
                             src.logout()
                         except Exception:
@@ -737,7 +771,7 @@ def migrate_mailbox(
                         size, flags, internaldate = fetch_message_meta(src, uid)
                         if append_limit and size > append_limit:
                             failed += 1
-                            print(
+                            log_message(
                             f"  [ERROR] UID {uid_str(uid)} - message size {size} exceeds destination APPEND limit {append_limit}"
                             )
                             continue
@@ -752,7 +786,7 @@ def migrate_mailbox(
                         migrated += 1
                     except Exception as exc:
                         if cfg.reconnect_on_failure and is_transport_error(exc):
-                            print("  [WARN] append failed due to socket error. Reconnecting destination...")
+                            log_message("  [WARN] append failed due to socket error. Reconnecting destination...")
                             try:
                                 dst.logout()
                             except Exception:
@@ -770,14 +804,14 @@ def migrate_mailbox(
 
             except Exception as exc:
                 failed += 1
-                print(f"  [ERROR] UID {uid_str(uid)} - {exc}")
+                log_message(f"  [ERROR] UID {uid_str(uid)} - {exc}")
             finally:
                 done = migrated + failed
                 if done - last_progress_print >= 25 or done == total:
                     elapsed_seconds = time.time() - start_time
                     elapsed = format_elapsed(elapsed_seconds)
                     eta = format_eta(done, total, elapsed_seconds)
-                    print(
+                    log_message(
                         f"  Progress {format_progress(done, total)} ({done}/{total}) Elapsed {elapsed} ETA {eta}"
                     )
                     last_progress_print = done
@@ -792,7 +826,7 @@ def migrate_mailbox(
 
     if cfg.verify_dest and not cfg.dry_run:
         dest_total = select_mailbox(dst, mailbox)
-        print(f"Destination messages (reported): {dest_total}")
+        log_message(f"Destination messages (reported): {dest_total}")
 
     return migrated, failed, src, dst
 
@@ -802,7 +836,7 @@ def migrate_account(cfg: MigrationConfig) -> Tuple[int, int]:
         src_conn = connect_imap(cfg.src, "source", cfg.socket_timeout)
         dst_conn = connect_imap(cfg.dst, "destination", cfg.socket_timeout)
     except Exception as exc:
-        print(f"Connection error: {exc}")
+        log_message(f"Connection error: {exc}")
         return 0, 1
 
     try:
@@ -812,10 +846,10 @@ def migrate_account(cfg: MigrationConfig) -> Tuple[int, int]:
             mailboxes = list_mailboxes(src_conn)
 
         if not mailboxes:
-            print("No mailboxes found on source.")
+            log_message("No mailboxes found on source.")
             return 0, 0
 
-        print(f"Mailboxes to migrate: {', '.join(mailboxes)}")
+        log_message(f"Mailboxes to migrate: {', '.join(mailboxes)}")
 
         total_migrated = 0
         total_failed = 0
@@ -858,7 +892,7 @@ def run_batch_migrations(batch_csv: str, settings: MigrationSettings, cfg: confi
 
     rows = load_batch_rows(batch_csv)
     if not rows:
-        print("No rows found in CSV.")
+        log_message("No rows found in CSV.")
         return 0
 
     total_migrated = 0
@@ -879,15 +913,15 @@ def run_batch_migrations(batch_csv: str, settings: MigrationSettings, cfg: confi
                 **vars(row_settings),
             )
 
-            print(f"\n=== Batch row {row_num}: {src.username} -> {dst.username} ===")
+            log_message(f"\n=== Batch row {row_num}: {src.username} -> {dst.username} ===")
             migrated, failed = migrate_account(cfg_row)
             total_migrated += migrated
             total_failed += failed
         except Exception as exc:
             total_failed += 1
-            print(f"[ERROR] Row {row_num}: {exc}")
+            log_message(f"[ERROR] Row {row_num}: {exc}")
 
-    print(f"\nBatch done. Migrated: {total_migrated}, Failed: {total_failed}")
+    log_message(f"\nBatch done. Migrated: {total_migrated}, Failed: {total_failed}")
     return 0 if total_failed == 0 else 1
 
 
@@ -912,6 +946,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--keepalive-every", type=int, help="Send NOOP every N messages (0 = off)")
     parser.add_argument("--socket-timeout", type=float, help="Socket timeout in seconds")
     parser.add_argument("--start-from", type=int, help="Start from message number in search results (1-based)")
+    parser.add_argument("--report-file", help="Path to report log file")
     parser.add_argument("--list-mailboxes", action="store_true", help="List mailboxes on source and exit")
     parser.add_argument(
         "--list-mailboxes-raw",
@@ -925,50 +960,59 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
     cfg_parser = load_config(args.config)
-    try:
-        settings = build_migration_settings(args, cfg_parser)
-    except Exception as exc:
-        print(f"Config error: {exc}")
-        return 2
-
-    batch_csv = args.batch_csv
-    if not batch_csv and cfg_parser.has_section("batch"):
-        batch_csv = cfg_parser.get("batch", "csv_path", fallback=None)
-    if batch_csv:
-        return run_batch_migrations(batch_csv, settings, cfg_parser)
+    report_path = args.report_file
+    if not report_path and cfg_parser.has_section("report"):
+        report_path = cfg_parser.get("report", "path", fallback=None)
+    if report_path:
+        open_report_file(report_path)
 
     try:
-        src = get_imap_config(cfg_parser, "source", "SRC")
-        dst = get_imap_config(cfg_parser, "destination", "DST")
-        cfg = MigrationConfig(src=src, dst=dst, **vars(settings))
+        try:
+            settings = build_migration_settings(args, cfg_parser)
+        except Exception as exc:
+            log_message(f"Config error: {exc}")
+            return 2
 
-        if args.list_mailboxes or args.list_mailboxes_raw:
-            src_conn = connect_imap(cfg.src, "source", cfg.socket_timeout)
-            try:
-                if args.list_mailboxes_raw:
-                    boxes = list_mailboxes_detailed(src_conn)
-                    print("Mailboxes on source (name | attrs | raw):")
-                    for name, attrs, raw in boxes:
-                        attrs_str = ",".join(attrs) if attrs else "-"
-                        print(f"  - {name} | {attrs_str} | {raw}")
-                else:
-                    boxes = list_mailboxes(src_conn)
-                    print("Mailboxes on source:")
-                    for name in boxes:
-                        print(f"  - {name}")
-                return 0
-            finally:
+        batch_csv = args.batch_csv
+        if not batch_csv and cfg_parser.has_section("batch"):
+            batch_csv = cfg_parser.get("batch", "csv_path", fallback=None)
+        if batch_csv:
+            return run_batch_migrations(batch_csv, settings, cfg_parser)
+
+        try:
+            src = get_imap_config(cfg_parser, "source", "SRC")
+            dst = get_imap_config(cfg_parser, "destination", "DST")
+            cfg = MigrationConfig(src=src, dst=dst, **vars(settings))
+
+            if args.list_mailboxes or args.list_mailboxes_raw:
+                src_conn = connect_imap(cfg.src, "source", cfg.socket_timeout)
                 try:
-                    src_conn.logout()
-                except Exception:
-                    pass
+                    if args.list_mailboxes_raw:
+                        boxes = list_mailboxes_detailed(src_conn)
+                        log_message("Mailboxes on source (name | attrs | raw):")
+                        for name, attrs, raw in boxes:
+                            attrs_str = ",".join(attrs) if attrs else "-"
+                            log_message(f"  - {name} | {attrs_str} | {raw}")
+                    else:
+                        boxes = list_mailboxes(src_conn)
+                        log_message("Mailboxes on source:")
+                        for name in boxes:
+                            log_message(f"  - {name}")
+                    return 0
+                finally:
+                    try:
+                        src_conn.logout()
+                    except Exception:
+                        pass
 
-        total_migrated, total_failed = migrate_account(cfg)
-        print(f"\nDone. Migrated: {total_migrated}, Failed: {total_failed}")
-        return 0 if total_failed == 0 else 1
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Partial migration may have completed.")
-        return 130
+            total_migrated, total_failed = migrate_account(cfg)
+            log_message(f"\nDone. Migrated: {total_migrated}, Failed: {total_failed}")
+            return 0 if total_failed == 0 else 1
+        except KeyboardInterrupt:
+            log_message("\nInterrupted by user. Partial migration may have completed.")
+            return 130
+    finally:
+        close_report_file()
 
 
 if __name__ == "__main__":
