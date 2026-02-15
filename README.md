@@ -42,13 +42,16 @@ use_ssl = true
 use_starttls = false
 
 [migration]
-mailboxes = INBOX
+mailboxes =
 batch_size = 200
 sleep_between_batches = 0
 sleep_per_message = 0
 keepalive_every = 0
 socket_timeout = 60
 start_from = 1
+
+[batch]
+csv_path = accounts.csv
 ```
 
 Tip: keep `config.ini` out of git. Store credentials locally.
@@ -74,6 +77,24 @@ List folders (useful for localized names):
 ./migrate_imap.py --config config.ini --list-mailboxes
 ./migrate_imap.py --config config.ini --list-mailboxes-raw
 ```
+
+## Batch Mode (CSV)
+You can migrate multiple account pairs using a CSV file. The script will automatically copy **all mailboxes** when the `mailboxes` setting is empty in `config.ini`.
+
+Create a CSV (see `accounts.sample.csv`):
+```csv
+src_username,src_password,dst_username,dst_password
+joao@email.com,SOURCE_PASSWORD,moacir@novoemail.com,DEST_PASSWORD
+```
+
+Run batch:
+```bash
+./migrate_imap.py --config config.ini --batch-csv accounts.csv
+```
+
+Notes:
+- Server settings always come from `config.ini` `[source]` and `[destination]`.
+- The CSV only contains account credentials.
 
 ## Common tuning options
 Use these when connections drop or the server throttles:

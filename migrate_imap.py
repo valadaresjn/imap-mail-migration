@@ -8,6 +8,7 @@ Preserves flags and internal date.
 
 import argparse
 import configparser
+import csv
 import imaplib
 import os
 import sys
@@ -15,7 +16,7 @@ import time
 import re
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Dict
 
 
 def _env(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -106,6 +107,24 @@ class MigrationConfig:
     start_from: int
 
 
+@dataclass
+class MigrationSettings:
+    mailboxes: List[str]
+    since: Optional[str]
+    batch_size: int
+    dry_run: bool
+    max_messages: Optional[int]
+    verify_dest: bool
+    mark_source_as_migrated: bool
+    migrated_flag: str
+    sleep_between_batches: float
+    reconnect_on_failure: bool
+    sleep_per_message: float
+    keepalive_every: int
+    socket_timeout: float
+    start_from: int
+
+
 def load_config(path: Optional[str]) -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
 
@@ -147,12 +166,112 @@ def get_imap_config(cfg: configparser.ConfigParser, section: str, prefix: str) -
     )
 
 
-def build_migration_config(args: argparse.Namespace) -> MigrationConfig:
-    cfg = load_config(args.config)
+def get_imap_defaults(cfg: configparser.ConfigParser, section: str, prefix: str) -> Dict[str, Optional[str]]:
+    if cfg.has_section(section):
+        host = cfg.get(section, "host", fallback=_env(f"{prefix}_HOST"))
+        port = cfg.getint(section, "port", fallback=int(_env(f"{prefix}_PORT", "993")))
+        use_ssl = cfg.getboolean(section, "use_ssl", fallback=_env(f"{prefix}_USE_SSL", "true").lower() == "true")
+        use_starttls = cfg.getboolean(
+            section, "use_starttls", fallback=_env(f"{prefix}_USE_STARTTLS", "false").lower() == "true"
+        )
+    else:
+        host = _env(f"{prefix}_HOST")
+        port = int(_env(f"{prefix}_PORT", "993"))
+        use_ssl = _env(f"{prefix}_USE_SSL", "true").lower() == "true"
+        use_starttls = _env(f"{prefix}_USE_STARTTLS", "false").lower() == "true"
+    return {
+        "host": host,
+        "port": port,
+        "use_ssl": use_ssl,
+        "use_starttls": use_starttls,
+    }
 
-    src = get_imap_config(cfg, "source", "SRC")
-    dst = get_imap_config(cfg, "destination", "DST")
 
+def parse_bool(value, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    val = str(value).strip().lower()
+    if val in {"1", "true", "yes", "y", "t"}:
+        return True
+    if val in {"0", "false", "no", "n", "f"}:
+        return False
+    return default
+
+
+def parse_int(value, default: int) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def normalize_row(row: Dict[str, str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for k, v in row.items():
+        if k is None:
+            continue
+        key = str(k).strip().lower()
+        if not key:
+            continue
+        out[key] = v.strip() if isinstance(v, str) else str(v)
+    return out
+
+
+def get_row_value(row: Dict[str, str], *keys: str, default: Optional[str] = None) -> Optional[str]:
+    for key in keys:
+        if key in row and row[key] != "":
+            return row[key]
+    return default
+
+
+def parse_mailboxes_field(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [m.strip() for m in value.split(",") if m.strip()]
+
+
+def build_imap_config_from_row(
+    row: Dict[str, str],
+    prefix: str,
+    defaults: Dict[str, Optional[str]],
+    row_num: int,
+) -> ImapConfig:
+    host = defaults.get("host")
+    port = defaults.get("port")
+    use_ssl = defaults.get("use_ssl", True)
+    use_starttls = defaults.get("use_starttls", False)
+    username = get_row_value(row, f"{prefix}_username", f"{prefix}_user", f"{prefix}_email")
+    password = get_row_value(row, f"{prefix}_password", f"{prefix}_pass")
+
+    missing = []
+    if not host:
+        missing.append("host (from config)")
+    if not port:
+        missing.append("port (from config)")
+    if username is None or username == "":
+        missing.append("username")
+    if password is None or password == "":
+        missing.append("password")
+    if missing:
+        raise ValueError(f"CSV row {row_num}: missing {prefix} fields: {', '.join(missing)}")
+
+    return ImapConfig(
+        host=str(host),
+        port=int(port),
+        username=str(username),
+        password=str(password),
+        use_ssl=bool(use_ssl),
+        use_starttls=bool(use_starttls),
+    )
+
+
+def build_migration_settings(args: argparse.Namespace, cfg: configparser.ConfigParser) -> MigrationSettings:
+    if not cfg.has_section("migration"):
+        cfg.add_section("migration")
     mailboxes = []
     if args.mailboxes:
         mailboxes = [m.strip() for m in args.mailboxes.split(",") if m.strip()]
@@ -183,9 +302,7 @@ def build_migration_config(args: argparse.Namespace) -> MigrationConfig:
     if start_from < 1:
         start_from = 1
 
-    return MigrationConfig(
-        src=src,
-        dst=dst,
+    return MigrationSettings(
         mailboxes=mailboxes,
         since=since,
         batch_size=batch_size,
@@ -200,6 +317,20 @@ def build_migration_config(args: argparse.Namespace) -> MigrationConfig:
         keepalive_every=keepalive_every,
         socket_timeout=socket_timeout,
         start_from=start_from,
+    )
+
+
+def build_migration_config(args: argparse.Namespace) -> MigrationConfig:
+    cfg = load_config(args.config)
+    settings = build_migration_settings(args, cfg)
+
+    src = get_imap_config(cfg, "source", "SRC")
+    dst = get_imap_config(cfg, "destination", "DST")
+
+    return MigrationConfig(
+        src=src,
+        dst=dst,
+        **vars(settings),
     )
 
 
@@ -666,6 +797,100 @@ def migrate_mailbox(
     return migrated, failed, src, dst
 
 
+def migrate_account(cfg: MigrationConfig) -> Tuple[int, int]:
+    try:
+        src_conn = connect_imap(cfg.src, "source", cfg.socket_timeout)
+        dst_conn = connect_imap(cfg.dst, "destination", cfg.socket_timeout)
+    except Exception as exc:
+        print(f"Connection error: {exc}")
+        return 0, 1
+
+    try:
+        if cfg.mailboxes:
+            mailboxes = cfg.mailboxes
+        else:
+            mailboxes = list_mailboxes(src_conn)
+
+        if not mailboxes:
+            print("No mailboxes found on source.")
+            return 0, 0
+
+        print(f"Mailboxes to migrate: {', '.join(mailboxes)}")
+
+        total_migrated = 0
+        total_failed = 0
+        for mailbox in mailboxes:
+            migrated, failed, src_conn, dst_conn = migrate_mailbox(src_conn, dst_conn, mailbox, cfg)
+            total_migrated += migrated
+            total_failed += failed
+
+        return total_migrated, total_failed
+    finally:
+        try:
+            src_conn.logout()
+        except Exception:
+            pass
+        try:
+            dst_conn.logout()
+        except Exception:
+            pass
+
+
+def load_batch_rows(path: str) -> List[Tuple[int, Dict[str, str]]]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"CSV file not found: {path}")
+    rows: List[Tuple[int, Dict[str, str]]] = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f, skipinitialspace=True)
+        if not reader.fieldnames:
+            raise ValueError("CSV file has no header row")
+        for idx, row in enumerate(reader, start=2):
+            norm = normalize_row(row)
+            if not norm or all(v == "" for v in norm.values()):
+                continue
+            rows.append((idx, norm))
+    return rows
+
+
+def run_batch_migrations(batch_csv: str, settings: MigrationSettings, cfg: configparser.ConfigParser) -> int:
+    defaults_src = get_imap_defaults(cfg, "source", "SRC")
+    defaults_dst = get_imap_defaults(cfg, "destination", "DST")
+
+    rows = load_batch_rows(batch_csv)
+    if not rows:
+        print("No rows found in CSV.")
+        return 0
+
+    total_migrated = 0
+    total_failed = 0
+
+    for row_num, row in rows:
+        try:
+            src = build_imap_config_from_row(row, "src", defaults_src, row_num)
+            dst = build_imap_config_from_row(row, "dst", defaults_dst, row_num)
+
+            row_settings = MigrationSettings(**vars(settings))
+            # In batch mode, per-row fields are limited to account credentials.
+            # All migration options come from config/CLI.
+
+            cfg_row = MigrationConfig(
+                src=src,
+                dst=dst,
+                **vars(row_settings),
+            )
+
+            print(f"\n=== Batch row {row_num}: {src.username} -> {dst.username} ===")
+            migrated, failed = migrate_account(cfg_row)
+            total_migrated += migrated
+            total_failed += failed
+        except Exception as exc:
+            total_failed += 1
+            print(f"[ERROR] Row {row_num}: {exc}")
+
+    print(f"\nBatch done. Migrated: {total_migrated}, Failed: {total_failed}")
+    return 0 if total_failed == 0 else 1
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="IMAP mailbox migration tool")
     parser.add_argument("--config", help="Path to INI config file")
@@ -693,71 +918,57 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         action="store_true",
         help="List mailboxes with raw IMAP LIST lines (for debugging)",
     )
+    parser.add_argument("--batch-csv", help="Path to CSV file for batch migrations")
     return parser.parse_args(argv)
 
 
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
+    cfg_parser = load_config(args.config)
     try:
-        cfg = build_migration_config(args)
+        settings = build_migration_settings(args, cfg_parser)
     except Exception as exc:
         print(f"Config error: {exc}")
         return 2
 
-    try:
-        src_conn = connect_imap(cfg.src, "source", cfg.socket_timeout)
-        dst_conn = connect_imap(cfg.dst, "destination", cfg.socket_timeout)
-    except Exception as exc:
-        print(f"Connection error: {exc}")
-        return 2
+    batch_csv = args.batch_csv
+    if not batch_csv and cfg_parser.has_section("batch"):
+        batch_csv = cfg_parser.get("batch", "csv_path", fallback=None)
+    if batch_csv:
+        return run_batch_migrations(batch_csv, settings, cfg_parser)
 
     try:
+        src = get_imap_config(cfg_parser, "source", "SRC")
+        dst = get_imap_config(cfg_parser, "destination", "DST")
+        cfg = MigrationConfig(src=src, dst=dst, **vars(settings))
+
         if args.list_mailboxes or args.list_mailboxes_raw:
-            if args.list_mailboxes_raw:
-                boxes = list_mailboxes_detailed(src_conn)
-                print("Mailboxes on source (name | attrs | raw):")
-                for name, attrs, raw in boxes:
-                    attrs_str = ",".join(attrs) if attrs else "-"
-                    print(f"  - {name} | {attrs_str} | {raw}")
-            else:
-                boxes = list_mailboxes(src_conn)
-                print("Mailboxes on source:")
-                for name in boxes:
-                    print(f"  - {name}")
-            return 0
+            src_conn = connect_imap(cfg.src, "source", cfg.socket_timeout)
+            try:
+                if args.list_mailboxes_raw:
+                    boxes = list_mailboxes_detailed(src_conn)
+                    print("Mailboxes on source (name | attrs | raw):")
+                    for name, attrs, raw in boxes:
+                        attrs_str = ",".join(attrs) if attrs else "-"
+                        print(f"  - {name} | {attrs_str} | {raw}")
+                else:
+                    boxes = list_mailboxes(src_conn)
+                    print("Mailboxes on source:")
+                    for name in boxes:
+                        print(f"  - {name}")
+                return 0
+            finally:
+                try:
+                    src_conn.logout()
+                except Exception:
+                    pass
 
-        if cfg.mailboxes:
-            mailboxes = cfg.mailboxes
-        else:
-            mailboxes = list_mailboxes(src_conn)
-
-        if not mailboxes:
-            print("No mailboxes found on source.")
-            return 0
-
-        print(f"Mailboxes to migrate: {', '.join(mailboxes)}")
-
-        total_migrated = 0
-        total_failed = 0
-        for mailbox in mailboxes:
-            migrated, failed, src_conn, dst_conn = migrate_mailbox(src_conn, dst_conn, mailbox, cfg)
-            total_migrated += migrated
-            total_failed += failed
-
+        total_migrated, total_failed = migrate_account(cfg)
         print(f"\nDone. Migrated: {total_migrated}, Failed: {total_failed}")
-        return 0
+        return 0 if total_failed == 0 else 1
     except KeyboardInterrupt:
         print("\nInterrupted by user. Partial migration may have completed.")
         return 130
-    finally:
-        try:
-            src_conn.logout()
-        except Exception:
-            pass
-        try:
-            dst_conn.logout()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
