@@ -3,6 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- (none)
+
+## [1.1.0] - 2026-02-15
 - Batch CSV mode for multiple account migrations (credentials only in CSV, server settings from config)
 - Report log output to a file via `--report-file` or `[report]` config
 - Sample CSV template and documentation updates for batch/report usage
